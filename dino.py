@@ -17,7 +17,7 @@ PATCH_SIZE = 14
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 # Transformation search parameters
-ROTATION_ANGLES = [-60, -30, -15, 0, 15, 30, 60]  # degrees
+ROTATION_ANGLES = [0]  # degrees
 SCALE_FACTORS = [0.80, 1.00, 1.20]       # relative to original size
 
 # ------------------------------------------------------------
@@ -94,7 +94,7 @@ def extract_dense_features(img: Image.Image):
 def compute_shared_masks(feats1, feats2, threshold=0.7):
     """
     Cross-correlate feats2 onto feats1 to find the best matching position.
-    Uses normalized cross-correlation for better matching.
+    Uses cosine similarity since features are already L2-normalized.
     
     Args:
         feats1: (H1, W1, C) - features from image 1 (larger/base image)
@@ -118,48 +118,27 @@ def compute_shared_masks(feats1, feats2, threshold=0.7):
     corr_w = W1 - W2 + 1
     correlation_map = torch.zeros(corr_h, corr_w)
     
-    # Normalize feats2 for cross-correlation
-    feats2_mean = feats2.mean()
-    feats2_std = feats2.std()
-    if feats2_std > 1e-6:
-        feats2_norm = (feats2 - feats2_mean) / feats2_std
-    else:
-        feats2_norm = feats2 - feats2_mean
-    
-    # Slide feats2 over feats1
+    # Features are already L2-normalized, so dot product = cosine similarity
+    # Slide feats2 over feats1 and compute average cosine similarity
     for i in range(corr_h):
         for j in range(corr_w):
             # Extract window from feats1
             window = feats1[i:i+H2, j:j+W2, :]  # (H2, W2, C)
             
-            # Compute normalized cross-correlation
-            window_mean = window.mean()
-            window_std = window.std()
-            if window_std > 1e-6:
-                window_norm = (window - window_mean) / window_std
-            else:
-                window_norm = window - window_mean
+            # Compute mean cosine similarity (element-wise dot product)
+            # Since both are L2-normalized, this gives cosine similarity per patch
+            similarity = (window * feats2).sum(dim=-1)  # (H2, W2) - cosine sim per patch
             
-            # Compute correlation coefficient
-            correlation = (window_norm * feats2_norm).sum() / (H2 * W2 * C)
-            correlation_map[i, j] = correlation
+            # Average similarity across all patches
+            correlation_map[i, j] = similarity.mean()
     
     # Find best position
     best_idx = correlation_map.argmax()
     best_row = best_idx // corr_w
     best_col = best_idx % corr_w
+    best_score = correlation_map[best_row, best_col].item()
     
-    # Normalize score by the statistics of the entire correlation map
-    # This makes scores comparable across different sized feature maps
-    corr_mean = correlation_map.mean()
-    corr_std = correlation_map.std()
-    if corr_std > 1e-6:
-        # Normalized peak: how many standard deviations above mean
-        normalized_score = (correlation_map[best_row, best_col] - corr_mean) / corr_std
-    else:
-        normalized_score = correlation_map[best_row, best_col]
-    
-    return best_row.item(), best_col.item(), normalized_score.item(), correlation_map.numpy()
+    return best_row.item(), best_col.item(), best_score, correlation_map.numpy()
 
 # ------------------------------------------------------------
 # Utility: Upsample mask to image size
