@@ -16,15 +16,28 @@ SIMILARITY_THRESHOLD = 0.9     # tune based on data
 PATCH_SIZE = 14
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
+# Transformation search parameters
+ROTATION_ANGLES = [-60, -30, -15, 0, 15, 30, 60]  # degrees
+SCALE_FACTORS = [0.80, 1.00, 1.20]       # relative to original size
+
 # ------------------------------------------------------------
 # Load DINOv2
 # ------------------------------------------------------------
-dinov2 = torch.hub.load(
-    "facebookresearch/dinov2",
-    MODEL_NAME,
-    pretrained=True
-).to(DEVICE)
-dinov2.eval()
+print("Loading DINOv2 model (this may take a minute on first run)...")
+try:
+    dinov2 = torch.hub.load(
+        "facebookresearch/dinov2",
+        MODEL_NAME,
+        pretrained=True,
+        force_reload=False  # Use cached version if available
+    ).to(DEVICE)
+    dinov2.eval()
+    print("Model loaded successfully!")
+except Exception as e:
+    print(f"Error loading DINOv2 model: {e}")
+    print("This may be due to network issues. Please check your internet connection.")
+    print("If the model was previously downloaded, it may be cached locally.")
+    raise
 
 # ------------------------------------------------------------
 # Preprocessing
@@ -81,6 +94,7 @@ def extract_dense_features(img: Image.Image):
 def compute_shared_masks(feats1, feats2, threshold=0.7):
     """
     Cross-correlate feats2 onto feats1 to find the best matching position.
+    Uses normalized cross-correlation for better matching.
     
     Args:
         feats1: (H1, W1, C) - features from image 1 (larger/base image)
@@ -104,23 +118,48 @@ def compute_shared_masks(feats1, feats2, threshold=0.7):
     corr_w = W1 - W2 + 1
     correlation_map = torch.zeros(corr_h, corr_w)
     
+    # Normalize feats2 for cross-correlation
+    feats2_mean = feats2.mean()
+    feats2_std = feats2.std()
+    if feats2_std > 1e-6:
+        feats2_norm = (feats2 - feats2_mean) / feats2_std
+    else:
+        feats2_norm = feats2 - feats2_mean
+    
     # Slide feats2 over feats1
     for i in range(corr_h):
         for j in range(corr_w):
             # Extract window from feats1
             window = feats1[i:i+H2, j:j+W2, :]  # (H2, W2, C)
             
-            # Compute mean cosine similarity between window and feats2
-            similarity = (window * feats2).sum(dim=-1)  # (H2, W2)
-            correlation_map[i, j] = similarity.mean()
+            # Compute normalized cross-correlation
+            window_mean = window.mean()
+            window_std = window.std()
+            if window_std > 1e-6:
+                window_norm = (window - window_mean) / window_std
+            else:
+                window_norm = window - window_mean
+            
+            # Compute correlation coefficient
+            correlation = (window_norm * feats2_norm).sum() / (H2 * W2 * C)
+            correlation_map[i, j] = correlation
     
     # Find best position
     best_idx = correlation_map.argmax()
     best_row = best_idx // corr_w
     best_col = best_idx % corr_w
-    best_score = correlation_map[best_row, best_col].item()
     
-    return best_row.item(), best_col.item(), best_score, correlation_map.numpy()
+    # Normalize score by the statistics of the entire correlation map
+    # This makes scores comparable across different sized feature maps
+    corr_mean = correlation_map.mean()
+    corr_std = correlation_map.std()
+    if corr_std > 1e-6:
+        # Normalized peak: how many standard deviations above mean
+        normalized_score = (correlation_map[best_row, best_col] - corr_mean) / corr_std
+    else:
+        normalized_score = correlation_map[best_row, best_col]
+    
+    return best_row.item(), best_col.item(), normalized_score.item(), correlation_map.numpy()
 
 # ------------------------------------------------------------
 # Utility: Upsample mask to image size
@@ -159,23 +198,43 @@ def save_correlation_map(correlation_map: np.ndarray, output_path: str):
 
 
 def save_overlay(base_img: Image.Image, overlay_img: Image.Image,
-                 pixel_row: int, pixel_col: int, output_path: str):
+                 pixel_row: int, pixel_col: int, output_path: str, angle: float = 0, scale: float = 1.0):
     base_np = np.array(base_img)
-    overlay_gray = np.array(overlay_img.convert("L"))
-    overlay_bgr = cv2.cvtColor(overlay_gray, cv2.COLOR_GRAY2BGR)
+    # Keep the transformed image in color (RGB)
+    overlay_rgb = np.array(overlay_img)
 
     r0, c0 = pixel_row, pixel_col
-    r1 = min(r0 + overlay_bgr.shape[0], base_np.shape[0])
-    c1 = min(c0 + overlay_bgr.shape[1], base_np.shape[1])
+    r1 = min(r0 + overlay_rgb.shape[0], base_np.shape[0])
+    c1 = min(c0 + overlay_rgb.shape[1], base_np.shape[1])
 
-    overlay_crop = overlay_bgr[:r1 - r0, :c1 - c0]
+    overlay_crop = overlay_rgb[:r1 - r0, :c1 - c0]
     base_crop = base_np[r0:r1, c0:c1]
 
+    # Blend the transformed colored image2 with image1
     blended = cv2.addWeighted(base_crop, 0.5, overlay_crop, 0.5, 0)
     vis = base_np.copy()
     vis[r0:r1, c0:c1] = blended
-    cv2.rectangle(vis, (c0, r0), (c1, r1), (0, 255, 0), 2)
+    cv2.rectangle(vis, (c0, r0), (c1, r1), (0, 255, 0), 3)
+    
+    # Add text showing transformation parameters
+    text = f"Rotation: {angle:.1f}deg, Scale: {scale:.2f}x"
+    cv2.putText(vis, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    
     cv2.imwrite(output_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+
+def apply_rotation_and_scale(img: Image.Image, angle: float, scale: float) -> Image.Image:
+    """Apply rotation and scaling to an image."""
+    w, h = img.size
+    # Scale first
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    img_scaled = img.resize((new_w, new_h), Image.BICUBIC)
+    
+    # Then rotate (expand=True to avoid cropping)
+    img_rotated = img_scaled.rotate(angle, resample=Image.BICUBIC, expand=True)
+    
+    return img_rotated
 
 
 # ------------------------------------------------------------
@@ -187,30 +246,100 @@ def process_pair(img1_path: str, img2_path: str, output_dir: str):
     img1 = load_image(img1_path)
     img2 = load_image(img2_path)
 
-    # Keep resized copies aligned with feature maps
+    # Keep resized copy of img1 aligned with feature maps
     img1_resized, _ = resize_to_divisible(img1)
-    img2_resized, _ = resize_to_divisible(img2)
-
     feats1 = extract_dense_features(img1_resized)
-    feats2 = extract_dense_features(img2_resized)
 
-    best_row, best_col, best_score, correlation_map = compute_shared_masks(
-        feats1, feats2, SIMILARITY_THRESHOLD
-    )
+    # Search over rotations and scales
+    best_overall_score = -float('inf')
+    best_result = None
+    all_results = []
 
+    total_transforms = len(ROTATION_ANGLES) * len(SCALE_FACTORS)
+    print(f"Searching {total_transforms} transformations (rotations × scales)...")
+    
+    for angle in ROTATION_ANGLES:
+        for scale in SCALE_FACTORS:
+            try:
+                # Apply transformation
+                img2_transformed = apply_rotation_and_scale(img2, angle, scale)
+                img2_resized, _ = resize_to_divisible(img2_transformed)
+                
+                # Extract features
+                feats2 = extract_dense_features(img2_resized)
+                
+                # Check if feats2 fits in feats1
+                if feats2.shape[0] > feats1.shape[0] or feats2.shape[1] > feats1.shape[1]:
+                    continue  # Skip if transformed image is too large
+                
+                # Compute correlation
+                best_row, best_col, best_score, correlation_map = compute_shared_masks(
+                    feats1, feats2, SIMILARITY_THRESHOLD
+                )
+                
+                # Store all results for later analysis
+                all_results.append({
+                    'angle': angle,
+                    'scale': scale,
+                    'score': best_score,
+                    'row': best_row,
+                    'col': best_col
+                })
+                
+                # Track best result
+                if best_score > best_overall_score:
+                    best_overall_score = best_score
+                    best_result = {
+                        'angle': angle,
+                        'scale': scale,
+                        'row': best_row,
+                        'col': best_col,
+                        'score': best_score,
+                        'correlation_map': correlation_map,
+                        'img2_transformed': img2_resized
+                    }
+                    print(f"  New best: angle={angle}°, scale={scale:.2f}, score={best_score:.4f}")
+            
+            except Exception as e:
+                print(f"  Skipped angle={angle}°, scale={scale:.2f}: {e}")
+                continue
+    
+    if best_result is None:
+        print("No valid transformation found!")
+        return
+    
+    # Print all results sorted by score for debugging
+    print(f"\nAll results (sorted by score):")
+    for result in sorted(all_results, key=lambda x: x['score'], reverse=True)[:10]:
+        print(f"  angle={result['angle']:3.0f}°, scale={result['scale']:.2f}, score={result['score']:8.4f}")
+    
+    # Use best result
+    angle = best_result['angle']
+    scale = best_result['scale']
+    best_row = best_result['row']
+    best_col = best_result['col']
+    best_score = best_result['score']
+    correlation_map = best_result['correlation_map']
+    img2_best = best_result['img2_transformed']
+    
     # Convert patch coordinates to pixel coordinates
     pixel_row = best_row * PATCH_SIZE
     pixel_col = best_col * PATCH_SIZE
 
+    # Save transformed image2
+    transformed_path = os.path.join(output_dir, "img2_transformed.png")
+    img2_best.save(transformed_path)
+    
     # Save correlation map
     corr_path = os.path.join(output_dir, "correlation_map.png")
     corr_saved = save_correlation_map(correlation_map, corr_path)
 
     # Save overlay visualization
     overlay_path = os.path.join(output_dir, "overlay_debug.png")
-    save_overlay(img1_resized, img2_resized, pixel_row, pixel_col, overlay_path)
+    save_overlay(img1_resized, img2_best, pixel_row, pixel_col, overlay_path, angle, scale)
 
-    print(f"Processed pair:\n  img1={img1_path}\n  img2={img2_path}")
+    print(f"\nProcessed pair:\n  img1={img1_path}\n  img2={img2_path}")
+    print(f"  Best transformation: angle={angle}°, scale={scale:.2f}")
     print(f"  Best position (patch coords): row={best_row}, col={best_col}")
     print(f"  Best position (pixels): row={pixel_row}, col={pixel_col}")
     print(f"  Correlation score: {best_score:.4f}")
@@ -219,6 +348,7 @@ def process_pair(img1_path: str, img2_path: str, output_dir: str):
         print(f"  Saved correlation map: {corr_path}")
     else:
         print("  Correlation map too small/flat to visualize")
+    print(f"  Saved transformed img2: {transformed_path}")
     print(f"  Saved overlay: {overlay_path}\n")
 
 
