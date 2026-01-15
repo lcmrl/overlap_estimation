@@ -14,6 +14,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "dinov2_vits14"
 PATCH_SIZE = 14
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+SCALES = [0.6]
 
 TOPK_RATIO = 0.25   # use top 25% most similar patches
 
@@ -48,6 +49,12 @@ def transform_image(img: Image.Image):
         std=(0.229, 0.224, 0.225)
     )(tensor)
     return tensor
+
+def scale_image(img: Image.Image, scale: float):
+    w, h = img.size
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return img.resize((new_w, new_h), Image.BICUBIC)
 
 # ------------------------------------------------------------
 # Dense feature extraction
@@ -132,40 +139,85 @@ def process_pair(img1_path, img2_path, output_dir):
     img2 = Image.open(img2_path).convert("RGB")
 
     img1_pad = pad_to_divisible(img1)
-    img2_pad = pad_to_divisible(img2)
-
     feats1 = extract_dense_features(img1_pad)
-    feats2 = extract_dense_features(img2_pad)
 
-    corr_map = correlate(feats1, feats2)
-    corr_np = corr_map.numpy()
+    best = {
+        "score": -float("inf"),
+        "scale": None,
+        "row": None,
+        "col": None,
+        "img2_scaled_pad": None,
+        "corr_map": None
+    }
 
-    best_idx = corr_np.argmax()
-    Hc, Wc = corr_np.shape
-    best_row = best_idx // Wc
-    best_col = best_idx % Wc
-    best_score = corr_np[best_row, best_col]
+    print(f"Searching over scales: {SCALES}")
 
-    pixel_row = best_row * PATCH_SIZE
-    pixel_col = best_col * PATCH_SIZE
+    for scale in SCALES:
+        try:
+            img2_scaled = scale_image(img2, scale)
+            img2_scaled_pad = pad_to_divisible(img2_scaled)
 
+            feats2 = extract_dense_features(img2_scaled_pad)
+
+            # Skip if template larger than base
+            if feats2.shape[1] > feats1.shape[1] or feats2.shape[2] > feats1.shape[2]:
+                print(f"  Scale {scale:.2f}: skipped (template too large)")
+                continue
+
+            corr_map = correlate(feats1, feats2)
+            corr_np = corr_map.numpy()
+
+            idx = corr_np.argmax()
+            Hc, Wc = corr_np.shape
+            row = idx // Wc
+            col = idx % Wc
+            score = corr_np[row, col]
+
+            print(f"  Scale {scale:.2f}: best score {score:.4f}")
+
+            if score > best["score"]:
+                best.update({
+                    "score": score,
+                    "scale": scale,
+                    "row": row,
+                    "col": col,
+                    "img2_scaled_pad": img2_scaled_pad,
+                    "corr_map": corr_np
+                })
+
+        except Exception as e:
+            print(f"  Scale {scale:.2f}: error ({e})")
+
+    if best["scale"] is None:
+        print("No valid scale produced a result.")
+        return
+
+    # Convert patch coords → pixel coords
+    pixel_row = best["row"] * PATCH_SIZE
+    pixel_col = best["col"] * PATCH_SIZE
+
+    # Save overlay
     save_overlay(
         img1_pad,
-        img2_pad,
+        best["img2_scaled_pad"],
         pixel_row,
         pixel_col,
         os.path.join(output_dir, "overlay.png")
     )
 
-    corr_vis = (corr_np - corr_np.min()) / (np.ptp(corr_np) + 1e-6)
+    # Save correlation map
+    corr = best["corr_map"]
+    corr_vis = (corr - corr.min()) / (np.ptp(corr) + 1e-6)
     corr_vis = (corr_vis * 255).astype(np.uint8)
     corr_vis = cv2.applyColorMap(corr_vis, cv2.COLORMAP_JET)
     cv2.imwrite(os.path.join(output_dir, "correlation_map.png"), corr_vis)
 
-    print(f"Best match:")
-    print(f"  Patch coords: row={best_row}, col={best_col}")
+    print("\nBest overall match:")
+    print(f"  Scale: {best['scale']:.2f}")
+    print(f"  Patch coords: row={best['row']}, col={best['col']}")
     print(f"  Pixel coords: row={pixel_row}, col={pixel_col}")
-    print(f"  Score: {best_score:.4f}")
+    print(f"  Score: {best['score']:.4f}")
+
 
 # ------------------------------------------------------------
 # CLI
