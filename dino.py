@@ -317,6 +317,11 @@ def process_pair(img1_path, img2_path, output_dir):
     pr = best["row"] * PATCH_SIZE
     pc = best["col"] * PATCH_SIZE
 
+    # Get center position of image2
+    img2_height, img2_width = np.array(best["img2"]).shape[:2]
+    center_row = pr + img2_height / 2.0
+    center_col = pc + img2_width / 2.0
+
     best["img2"].save(os.path.join(output_dir, "img2_transformed.png"))
     save_overlay(
         img1_pad,
@@ -332,8 +337,18 @@ def process_pair(img1_path, img2_path, output_dir):
         cv2.applyColorMap(corr_vis, cv2.COLORMAP_JET)
     )
 
+    # Save results to text file (center position, not top-left corner)
+    results_file = os.path.join(output_dir, "results.txt")
+    with open(results_file, 'w') as f:
+        f.write(f"{center_row},{center_col},{best['rotation']},{best['scale']},{best['score']}\n")
+    
     print("Best match:")
-    print(best)
+    print(f"  Center Position (row, col): ({center_row:.1f}, {center_col:.1f}) pixels")
+    print(f"  Top-Left Position (row, col): ({pr}, {pc}) pixels")
+    print(f"  Rotation: {best['rotation']}°")
+    print(f"  Scale: {best['scale']}")
+    print(f"  Score: {best['score']:.4f}")
+    print(f"  Results saved to: {results_file}")
 
 # ------------------------------------------------------------
 # CLI
@@ -352,6 +367,8 @@ if __name__ == "__main__":
     parser.add_argument("directory", help="Directory containing exactly two images")
     parser.add_argument("--dino-version", choices=["v2", "v3"], default="v2",
                         help="DINO model version: v2 (DINOv2) or v3 (DINOv3, requires HF auth)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress output except errors")
     args = parser.parse_args()
 
     # Configure DINO version based on command line argument
