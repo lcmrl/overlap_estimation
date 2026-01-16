@@ -14,13 +14,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-SCALES = [0.8, 1.0, 1.2]
-ROTATIONS = list(range(-30, 35, 10))
+SCALES = [0.5, 1.0, 1.5]
+ROTATIONS = list(range(-180, 180, 90))
 
 # Global variables that will be set by command line args
 DINO_VERSION = None
 MODEL_NAME = None
 PATCH_SIZE = None
+DOWNSCALE_FACTOR = 1.0  # Default: no downscaling
 dino_model = None
 dino_processor = None
 
@@ -266,6 +267,14 @@ def process_pair(img1_path, img2_path, output_dir):
     img1 = Image.open(img1_path).convert("RGB")
     img2 = Image.open(img2_path).convert("RGB")
 
+    # Apply downscaling if specified
+    if DOWNSCALE_FACTOR != 1.0:
+        print(f"Downscaling images by factor {DOWNSCALE_FACTOR}...")
+        img1 = scale_image(img1, DOWNSCALE_FACTOR)
+        img2 = scale_image(img2, DOWNSCALE_FACTOR)
+        print(f"  Image 1 new size: {img1.size}")
+        print(f"  Image 2 new size: {img2.size}")
+
     img1_pad = pad_to_divisible(img1)
     feats1 = extract_dense_features(img1_pad)
 
@@ -317,18 +326,28 @@ def process_pair(img1_path, img2_path, output_dir):
     pr = best["row"] * PATCH_SIZE
     pc = best["col"] * PATCH_SIZE
 
-    # Get center position of image2
-    img2_height, img2_width = np.array(best["img2"]).shape[:2]
-    center_row = pr + img2_height / 2.0
-    center_col = pc + img2_width / 2.0
-
+    # Save overlay with downscaled images and downscaled coordinates
     best["img2"].save(os.path.join(output_dir, "img2_transformed.png"))
     save_overlay(
         img1_pad,
         best["img2"],
-        pr, pc,
+        int(pr), int(pc),  # Use downscaled coordinates for downscaled images
         os.path.join(output_dir, "overlay.png")
     )
+
+    # Scale coordinates back to original image space if downscaling was applied
+    if DOWNSCALE_FACTOR != 1.0:
+        pr = pr / DOWNSCALE_FACTOR
+        pc = pc / DOWNSCALE_FACTOR
+
+    # Get center position of image2
+    img2_height, img2_width = np.array(best["img2"]).shape[:2]
+    # Scale image2 dimensions back to original space if downscaling was applied
+    if DOWNSCALE_FACTOR != 1.0:
+        img2_height = img2_height / DOWNSCALE_FACTOR
+        img2_width = img2_width / DOWNSCALE_FACTOR
+    center_row = pr + img2_height / 2.0
+    center_col = pc + img2_width / 2.0
 
     corr = best["corr"]
     corr_vis = ((corr - corr.min()) / (np.ptp(corr) + 1e-6) * 255).astype(np.uint8)
@@ -367,12 +386,19 @@ if __name__ == "__main__":
     parser.add_argument("directory", help="Directory containing exactly two images")
     parser.add_argument("--dino-version", choices=["v2", "v3"], default="v2",
                         help="DINO model version: v2 (DINOv2) or v3 (DINOv3, requires HF auth)")
+    parser.add_argument("--downscale-factor", type=float, default=1.0,
+                        help="Downscale factor for input images (e.g., 0.5 for half size, 2.0 for double). Default: 1.0 (no scaling)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress output except errors")
     args = parser.parse_args()
 
     # Configure DINO version based on command line argument
     DINO_VERSION = args.dino_version
+    DOWNSCALE_FACTOR = args.downscale_factor
+    
+    if DOWNSCALE_FACTOR <= 0:
+        print("Error: --downscale-factor must be positive")
+        exit(1)
     
     if DINO_VERSION == "v2":
         MODEL_NAME = "dinov2_vits14"  # Options: dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14
