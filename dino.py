@@ -13,9 +13,10 @@ from PIL import Image, ImageOps
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "dinov2_vits14"
 PATCH_SIZE = 14
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 SCALES = [0.6]
-ROTATIONS = list(range(-60, 60, 15))
+ROTATIONS = list(range(-30, 35, 10))
 print("Scales:", SCALES)
 print("Rotations:", ROTATIONS)
 
@@ -231,11 +232,37 @@ def process_pair(img1_path, img2_path, output_dir):
 # ------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------
+def list_images(directory):
+    """Find all image files in directory."""
+    images = []
+    for name in os.listdir(directory):
+        ext = os.path.splitext(name)[1].lower()
+        if ext in IMAGE_EXTENSIONS:
+            images.append(os.path.join(directory, name))
+    return sorted(images)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("img1")
-    parser.add_argument("img2")
+    parser = argparse.ArgumentParser(description="Find best alignment between two images.")
+    parser.add_argument("directory", help="Directory containing exactly two images")
     args = parser.parse_args()
 
-    out_dir = os.path.join(os.path.dirname(args.img1) or ".", "outputs")
-    process_pair(args.img1, args.img2, out_dir)
+    if not os.path.isdir(args.directory):
+        print(f"Error: '{args.directory}' is not a directory")
+        exit(1)
+
+    images = list_images(args.directory)
+    
+    if len(images) < 2:
+        print(f"Error: Found only {len(images)} image(s) in '{args.directory}', need at least 2")
+        exit(1)
+    
+    if len(images) > 2:
+        print(f"Warning: Found {len(images)} images, using the first two:")
+    
+    img1_path = images[0]
+    img2_path = images[1]
+    print(f"  Image 1: {os.path.basename(img1_path)}")
+    print(f"  Image 2: {os.path.basename(img2_path)}")
+
+    out_dir = os.path.join(args.directory, "outputs")
+    process_pair(img1_path, img2_path, out_dir)
