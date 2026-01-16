@@ -12,92 +12,24 @@ from PIL import Image, ImageOps
 # ------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Choose DINO version: "v2" or "v3"
-DINO_VERSION = "v3"  # Change to "v3" to use DINOv3 (requires HF authentication)
-
-if DINO_VERSION == "v2":
-    MODEL_NAME = "dinov2_vits14"  # Options: dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14
-    PATCH_SIZE = 14
-elif DINO_VERSION == "v3":
-    # NOTE: DINOv3 models are gated on Hugging Face - requires authentication
-    MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"  # DINOv3 from Hugging Face
-    PATCH_SIZE = 16
-else:
-    raise ValueError(f"Unknown DINO version: {DINO_VERSION}")
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-SCALES = [0.6]
+SCALES = [0.6, 0.8, 1.0, 1.2]
 ROTATIONS = list(range(-30, 35, 10))
-print(f"DINO Version: {DINO_VERSION}")
-print("Scales:", SCALES)
-print("Rotations:", ROTATIONS)
 
-# ------------------------------------------------------------
-# Load DINO model
-# ------------------------------------------------------------
-print(f"Loading {MODEL_NAME}...")
-
-if DINO_VERSION == "v2":
-    try:
-        dinov2 = torch.hub.load(
-            "facebookresearch/dinov2",
-            MODEL_NAME,
-            pretrained=True
-        ).to(DEVICE)
-        dinov2.eval()
-        dino_model = dinov2
-        print("DINOv2 model loaded successfully!")
-    except Exception as e:
-        print(f"Error loading DINOv2: {e}")
-        print("Attempting to load from local cache...")
-        dinov2 = torch.hub.load(
-            "facebookresearch/dinov2",
-            MODEL_NAME,
-            pretrained=True,
-            force_reload=False
-        ).to(DEVICE)
-        dinov2.eval()
-        dino_model = dinov2
-        print("DINOv2 model loaded from cache.")
-elif DINO_VERSION == "v3":
-    try:
-        from transformers import AutoImageProcessor, AutoModel
-        print("Loading DINOv3 from Hugging Face...")
-        print(f"Note: {MODEL_NAME} is a gated model - you need Hugging Face authentication.")
-        dino_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-        dino_model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
-        dino_model.eval()
-        print("DINOv3 model loaded successfully!")
-    except ImportError:
-        print("\nError: transformers library required for DINOv3.")
-        print("Install with: pip install transformers")
-        exit(1)
-    except Exception as e:
-        error_msg = str(e)
-        if "gated" in error_msg.lower() or "401" in error_msg or "access" in error_msg.lower():
-            print("\n" + "="*70)
-            print("ERROR: DINOv3 model requires Hugging Face authentication")
-            print("="*70)
-            print("\nTo use DINOv3, you need to:")
-            print("1. Create a Hugging Face account at https://huggingface.co/join")
-            print("2. Request access to the model at:")
-            print(f"   https://huggingface.co/{MODEL_NAME}")
-            print("3. Install huggingface-hub: pip install huggingface-hub")
-            print("4. Login with your token:")
-            print("   huggingface-cli login")
-            print("   (Get token from https://huggingface.co/settings/tokens)")
-            print("\nAlternatively, switch to DINOv2 by changing:")
-            print('   DINO_VERSION = "v2"  # in the script')
-            print("="*70)
-        else:
-            print(f"\nError loading DINOv3: {e}")
-        exit(1)
+# Global variables that will be set by command line args
+DINO_VERSION = None
+MODEL_NAME = None
+PATCH_SIZE = None
+dino_model = None
+dino_processor = None
 
 # ------------------------------------------------------------
 # Padding (top-left aligned - NOT symmetric)
 # ------------------------------------------------------------
-def pad_to_divisible(img: Image.Image, divisor=PATCH_SIZE):
+def pad_to_divisible(img: Image.Image, divisor=None):
+    if divisor is None:
+        divisor = PATCH_SIZE if PATCH_SIZE is not None else 14
     w, h = img.size
     pw = (divisor - w % divisor) % divisor
     ph = (divisor - h % divisor) % divisor
@@ -169,7 +101,11 @@ def extract_dense_features(img: Image.Image):
     if DINO_VERSION == "v2":
         x = transform_image(img).unsqueeze(0).to(DEVICE)
         feats = dino_model.forward_features(x)["x_norm_patchtokens"]
-        feats = feats.squeeze(0)
+        feats = feats.squeeze(0)  # (N, C) where N = H*W
+        
+        # Despite the name "x_norm_patchtokens", these are NOT L2-normalized
+        # Normalize them for consistent behavior with v3
+        feats = F.normalize(feats, dim=1, p=2)
     
     elif DINO_VERSION == "v3":
         # DINOv3: Use manual transforms to preserve image dimensions
@@ -188,23 +124,19 @@ def extract_dense_features(img: Image.Image):
         # DINOv3 may have: [CLS] + [registers] + [spatial patches] or [CLS] + [spatial patches] + [registers]
         # We need exactly H*W patch tokens
         # Skip CLS token (first), then take exactly expected_patches
-        feats = all_tokens[1:1+expected_patches]  # Skip CLS, take spatial patches
+        feats = all_tokens[1:1+expected_patches]  # Skip CLS, take spatial patches (N, C)
         
         if feats.shape[0] != expected_patches:
             print(f"WARNING: Expected {expected_patches} patches but got {feats.shape[0]}")
             # If still mismatched, try taking from the end (registers might be after CLS)
             feats = all_tokens[-expected_patches:]
+        
+        # DINOv3 features are NOT normalized, so we need to normalize them
+        # For proper cosine similarity via convolution, each feature vector must be L2-normalized
+        feats = F.normalize(feats, dim=1, p=2)  # Normalize along the feature dimension
     
-    # feats is now (N, C) where N = H*W
-    # For proper cosine similarity via convolution, each feature vector must be L2-normalized
-    # Normalize in the (N, C) format: normalize each row (each spatial position's C-dim vector)
-    feats = F.normalize(feats, dim=1, p=2)  # Normalize along the feature dimension
-    
-    # Verify normalization: compute norms
-    norms = torch.norm(feats, dim=1, p=2)
-    print(f"DEBUG norms after normalize: min={norms.min():.6f}, max={norms.max():.6f}, mean={norms.mean():.6f}")
-    
-    # Now reshape to spatial grid and permute to (C, H, W)
+    # feats is now (N, C) where N = H*W, and each vector is L2-normalized
+    # Reshape to spatial grid and permute to (C, H, W)
     feats = feats.reshape(H, W, -1).permute(2, 0, 1)
 
     return feats.cpu()
@@ -264,33 +196,40 @@ def masked_correlate(feats1, feats2, mask2):
     feats1 = feats1.unsqueeze(0)  # (1, C, H1, W1)
     feats2 = feats2.unsqueeze(0)  # (1, C, H2, W2)
 
-    # Create Gaussian weights centered on template
-    H2, W2 = feats2.shape[2], feats2.shape[3]
-    gaussian_weights = create_gaussian_weights(H2, W2).to(feats2.device)
-    
-    # Combine mask with Gaussian weights
-    # This gives higher weight to center patches
-    combined_weights = mask2 * gaussian_weights
+    # Apply mask to features (zero out invalid regions)
+    # Expand mask to all channels: (1, 1, H2, W2) -> (1, C, H2, W2)
+    mask2_expanded = mask2.expand(-1, feats2.shape[1], -1, -1)
+    feats2_masked = feats2 * mask2_expanded
 
-    # CRITICAL: Apply combined weights to features
-    # Expand weights to all channels: (1, 1, H2, W2) -> (1, C, H2, W2)
-    weights_expanded = combined_weights.expand(-1, feats2.shape[1], -1, -1)
-    feats2_weighted = feats2 * weights_expanded
+    # Compute correlation with masked features (preserves L2 normalization where valid)
+    corr = F.conv2d(feats1, feats2_masked)
 
-    # Now correlate with weighted features
-    corr = F.conv2d(feats1, feats2_weighted)
-    
-    print(f"DEBUG corr before norm: min={corr.min():.4f}, max={corr.max():.4f}, mean={corr.mean():.4f}")
-
-    # Count weighted valid patches
+    # Count how many valid patches contributed to each position
     ones = torch.ones_like(mask2)
-    valid = F.conv2d(ones, combined_weights)
+    valid_count = F.conv2d(ones, mask2)
 
-    # Normalize by weighted count of valid patches
-    corr = corr / (valid + 1e-6)
+    # Normalize by number of valid patches (not weighted yet)
+    corr = corr / (valid_count + 1e-6)
     
-    print(f"DEBUG corr after norm: min={corr.min():.4f}, max={corr.max():.4f}, mean={corr.mean():.4f}")
-    print(f"DEBUG valid counts: min={valid.min():.4f}, max={valid.max():.4f}")
+    # Now apply Gaussian center weighting to the correlation scores
+    # This gives more importance to matches where the center of template is well-matched
+    H2, W2 = feats2.shape[2], feats2.shape[3]
+    gaussian_weights = create_gaussian_weights(H2, W2).to(corr.device)
+    
+    # Create a weighted valid count map for proper normalization
+    weighted_valid = F.conv2d(ones, mask2 * gaussian_weights)
+    unweighted_valid = valid_count
+    
+    # Apply Gaussian weighting to correlation: weight each position by sum of Gaussian weights
+    # that contributed to that correlation value
+    weight_sum = F.conv2d(ones, gaussian_weights)  # Sum of weights that would apply
+    
+    # Recompute correlation with Gaussian-weighted template
+    feats2_weighted = feats2 * mask2_expanded * gaussian_weights.expand(-1, feats2.shape[1], -1, -1)
+    corr_weighted = F.conv2d(feats1, feats2_weighted)
+    
+    # Normalize by the sum of weights that contributed (accounting for mask)
+    corr = corr_weighted / (weighted_valid + 1e-6)
     
     return corr.squeeze(0).squeeze(0)
 
@@ -406,7 +345,84 @@ def list_images(directory):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find best alignment between two images.")
     parser.add_argument("directory", help="Directory containing exactly two images")
+    parser.add_argument("--dino-version", choices=["v2", "v3"], default="v2",
+                        help="DINO model version: v2 (DINOv2) or v3 (DINOv3, requires HF auth)")
     args = parser.parse_args()
+
+    # Configure DINO version based on command line argument
+    DINO_VERSION = args.dino_version
+    
+    if DINO_VERSION == "v2":
+        MODEL_NAME = "dinov2_vits14"  # Options: dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14
+        PATCH_SIZE = 14
+    elif DINO_VERSION == "v3":
+        # NOTE: DINOv3 models are gated on Hugging Face - requires authentication
+        MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"  # DINOv3 from Hugging Face
+        PATCH_SIZE = 16
+    else:
+        raise ValueError(f"Unknown DINO version: {DINO_VERSION}")
+    
+    print(f"DINO Version: {DINO_VERSION}")
+    print("Scales:", SCALES)
+    print("Rotations:", ROTATIONS)
+    
+    # Load DINO model
+    print(f"Loading {MODEL_NAME}...")
+    
+    if DINO_VERSION == "v2":
+        try:
+            dinov2 = torch.hub.load(
+                "facebookresearch/dinov2",
+                MODEL_NAME,
+                pretrained=True
+            ).to(DEVICE)
+            dinov2.eval()
+            dino_model = dinov2
+            print("DINOv2 model loaded successfully!")
+        except Exception as e:
+            print(f"Error loading DINOv2: {e}")
+            print("Attempting to load from local cache...")
+            dinov2 = torch.hub.load(
+                "facebookresearch/dinov2",
+                MODEL_NAME,
+                pretrained=True,
+                force_reload=False
+            ).to(DEVICE)
+            dinov2.eval()
+            dino_model = dinov2
+            print("DINOv2 model loaded from cache.")
+    elif DINO_VERSION == "v3":
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+            print("Loading DINOv3 from Hugging Face...")
+            print(f"Note: {MODEL_NAME} is a gated model - you need Hugging Face authentication.")
+            dino_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+            dino_model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
+            dino_model.eval()
+            print("DINOv3 model loaded successfully!")
+        except ImportError:
+            print("\nError: transformers library required for DINOv3.")
+            print("Install with: pip install transformers")
+            exit(1)
+        except Exception as e:
+            error_msg = str(e)
+            if "gated" in error_msg.lower() or "401" in error_msg or "access" in error_msg.lower():
+                print("\n" + "="*70)
+                print("ERROR: DINOv3 model requires Hugging Face authentication")
+                print("="*70)
+                print("\nTo access this gated model, you need to:")
+                print("1. Create a Hugging Face account at https://huggingface.co/")
+                print("2. Request access to the model at:")
+                print(f"   https://huggingface.co/{MODEL_NAME}")
+                print("3. Login via command line:")
+                print("   huggingface-cli login")
+                print("4. Or set your token in environment:")
+                print("   export HF_TOKEN=your_token_here")
+                print("\nAlternatively, use DINOv2 with --dino-version v2")
+                print("="*70)
+            else:
+                print(f"\nError loading DINOv3: {e}")
+            exit(1)
 
     if not os.path.isdir(args.directory):
         print(f"Error: '{args.directory}' is not a directory")
