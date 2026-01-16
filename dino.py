@@ -14,7 +14,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-SCALES = [0.6, 0.8, 1.0, 1.2]
+SCALES = [0.8, 1.0, 1.2]
 ROTATIONS = list(range(-30, 35, 10))
 
 # Global variables that will be set by command line args
@@ -185,51 +185,56 @@ def create_gaussian_weights(H, W, sigma_factor=0.3):
     return weights.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
 
 # ------------------------------------------------------------
-# Masked correlation with Gaussian center weighting
+# Masked correlation with optional Gaussian center weighting
 # ------------------------------------------------------------
-def masked_correlate(feats1, feats2, mask2):
+def masked_correlate(feats1, feats2, mask2, use_gaussian_weighting=True):
     """
     feats1: (C, H1, W1)
     feats2: (C, H2, W2)
     mask2 : (1, 1, H2, W2)
+    
+    Returns normalized correlation that is comparable across different template sizes.
     """
     feats1 = feats1.unsqueeze(0)  # (1, C, H1, W1)
     feats2 = feats2.unsqueeze(0)  # (1, C, H2, W2)
 
-    # Apply mask to features (zero out invalid regions)
-    # Expand mask to all channels: (1, 1, H2, W2) -> (1, C, H2, W2)
-    mask2_expanded = mask2.expand(-1, feats2.shape[1], -1, -1)
-    feats2_masked = feats2 * mask2_expanded
-
-    # Compute correlation with masked features (preserves L2 normalization where valid)
-    corr = F.conv2d(feats1, feats2_masked)
-
-    # Count how many valid patches contributed to each position
-    ones = torch.ones_like(mask2)
-    valid_count = F.conv2d(ones, mask2)
-
-    # Normalize by number of valid patches (not weighted yet)
-    corr = corr / (valid_count + 1e-6)
-    
-    # Now apply Gaussian center weighting to the correlation scores
-    # This gives more importance to matches where the center of template is well-matched
     H2, W2 = feats2.shape[2], feats2.shape[3]
-    gaussian_weights = create_gaussian_weights(H2, W2).to(corr.device)
     
-    # Create a weighted valid count map for proper normalization
-    weighted_valid = F.conv2d(ones, mask2 * gaussian_weights)
-    unweighted_valid = valid_count
+    if not use_gaussian_weighting:
+        # Simple masked correlation without Gaussian weighting
+        mask2_expanded = mask2.expand(-1, feats2.shape[1], -1, -1)
+        feats2_masked = feats2 * mask2_expanded
+        
+        corr = F.conv2d(feats1, feats2_masked)
+        
+        ones = torch.ones_like(mask2)
+        valid_count = F.conv2d(ones, mask2)
+        
+        # Normalize by valid count to get average cosine similarity
+        # This makes scores comparable across different template sizes
+        corr = corr / (valid_count + 1e-6)
+        return corr.squeeze(0).squeeze(0)
     
-    # Apply Gaussian weighting to correlation: weight each position by sum of Gaussian weights
-    # that contributed to that correlation value
-    weight_sum = F.conv2d(ones, gaussian_weights)  # Sum of weights that would apply
+    # Gaussian weighted correlation - compute per-patch weighted sum
+    # Create Gaussian weights
+    gaussian_weights = create_gaussian_weights(H2, W2).to(feats2.device)
     
-    # Recompute correlation with Gaussian-weighted template
-    feats2_weighted = feats2 * mask2_expanded * gaussian_weights.expand(-1, feats2.shape[1], -1, -1)
-    corr_weighted = F.conv2d(feats1, feats2_weighted)
+    # Combine with mask
+    combined_weights = mask2 * gaussian_weights
     
-    # Normalize by the sum of weights that contributed (accounting for mask)
-    corr = corr_weighted / (weighted_valid + 1e-6)
+    # Apply weights to features
+    weights_expanded = combined_weights.expand(-1, feats2.shape[1], -1, -1)
+    feats2_weighted = feats2 * weights_expanded
+    
+    # Compute weighted correlation
+    corr = F.conv2d(feats1, feats2_weighted)
+    
+    # Normalize by sum of weights to get weighted average similarity
+    # This makes scores comparable across different template sizes
+    ones = torch.ones_like(mask2)
+    sum_weights = F.conv2d(ones, combined_weights)
+    
+    corr = corr / (sum_weights + 1e-6)
     
     return corr.squeeze(0).squeeze(0)
 
